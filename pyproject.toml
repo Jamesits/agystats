@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agystats"
+version = "0.1.0"
+description = "Local telemetry, latency roofline, and offline cost/credits dashboard for Antigravity CLI (Report Mode & Realtime TUI)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+agystats = "agystats.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agystats*"]
+
+[tool.setuptools.package-data]
+agystats = ["pricing.json"]
