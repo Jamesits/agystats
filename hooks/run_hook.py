@@ -10,7 +10,43 @@ import time
 _SAFE_CONV_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
-def _get_state_dir() -> str:
+def _app_data_from_executable_data_dir(raw_dir: str) -> str | None:
+    if not raw_dir or not raw_dir.strip():
+        return None
+    cur = os.path.normpath(os.path.expanduser(raw_dir.strip()))
+    while cur:
+        parent = os.path.dirname(cur)
+        if os.path.basename(cur) == "sidecar_data" and parent and parent != cur:
+            return parent
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _app_data_from_transcript_path(transcript_path: str) -> str | None:
+    if not transcript_path or not transcript_path.strip():
+        return None
+    expanded = os.path.expanduser(transcript_path.strip())
+    if not os.path.isabs(expanded):
+        return None
+    cur = os.path.normpath(expanded)
+    while cur:
+        parent = os.path.dirname(cur)
+        if (
+            os.path.basename(cur) == "brain"
+            and parent
+            and parent != cur
+            and parent != os.sep
+        ):
+            return parent
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _get_state_dir(transcript_path: str = "") -> str:
     for env_key in ("AGYSTATS_STATE_DIR", "AGY_METRICS_STATE_DIR", "PLUGIN_DATA"):
         explicit = os.environ.get(env_key)
         if explicit:
@@ -27,6 +63,11 @@ def _get_state_dir() -> str:
         if val:
             app_data = os.path.expanduser(val)
             break
+
+    if app_data is None:
+        app_data = _app_data_from_executable_data_dir(
+            os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or ""
+        ) or _app_data_from_transcript_path(transcript_path)
 
     if app_data is None:
         cli_dir = os.path.expanduser("~/.gemini/antigravity-cli")
@@ -56,7 +97,8 @@ def _record_event(ts_ms: int, argv_event: str) -> str:
     if not conv_id or not _SAFE_CONV_RE.fullmatch(conv_id):
         return event_name
 
-    state_dir = _get_state_dir()
+    transcript_path = str(payload.get("transcriptPath") or "")
+    state_dir = _get_state_dir(transcript_path)
     conv_dir = os.path.join(state_dir, "conversations")
     os.makedirs(conv_dir, exist_ok=True)
 
@@ -68,7 +110,7 @@ def _record_event(ts_ms: int, argv_event: str) -> str:
         "event": event_name,
         "conversation_id": conv_id,
         "model_name": payload.get("modelName") or "",
-        "transcript_path": payload.get("transcriptPath") or "",
+        "transcript_path": transcript_path,
         "workspace_paths": payload.get("workspacePaths") or [],
         "invocation_num": payload.get("invocationNum"),
         "step_idx": payload.get("stepIdx"),

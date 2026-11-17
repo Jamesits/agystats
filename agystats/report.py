@@ -29,9 +29,11 @@ from .formatters import (
     fmt_short_delay,
     fmt_usd,
     fmt_wasted_summary,
+    is_aggregate_mode,
     resolve_model_entry,
     short_model_name,
     src_label,
+    strip_subagent_prefix,
 )
 
 
@@ -71,25 +73,35 @@ def render_conversation_list(
         expand=True,
     )
     table.add_column("ID", style="dim", no_wrap=True)
-    table.add_column("Title", overflow="fold")
-    table.add_column("Model", no_wrap=True)
+    table.add_column("Project", max_width=16, no_wrap=True, overflow="ellipsis")
+    table.add_column("Title", min_width=20, overflow="fold")
+    table.add_column("Model", max_width=20, no_wrap=True, overflow="ellipsis")
     table.add_column("Steps", justify="right", no_wrap=True)
     table.add_column("Context", justify="right", no_wrap=True)
     table.add_column("Status", no_wrap=True)
 
     if not convs:
-        table.add_row("—", "No conversations found", "—", "0", "0", "idle")
+        table.add_row("—", "—", "No conversations found", "—", "0", "0", "idle")
     else:
         for c in convs:
             cid = str(c.get("conversation_id") or "")
             is_active = cid == active_id
             is_sub = bool(c.get("is_subagent"))
-            prefix = "↳ " if is_sub else ("★ " if is_active else "  ")
+            depth = max(1, int(c.get("nesting_depth") or 1)) if is_sub else 0
+            if is_sub:
+                prefix = ("  " * max(0, depth - 1)) + ("★ ↳ " if is_active else "↳ ")
+            else:
+                prefix = "★ " if is_active else "  "
             title = str(c.get("title") or cid[:8])
+            agent_name = str(c.get("agent_name") or "").strip()
+            if is_sub and agent_name and agent_name.lower() not in title.lower():
+                title = f"{title} · {agent_name}"
+            project_name = str(c.get("project_name") or "No Project")
             status = str(c.get("status") or "idle")
             status_txt = Text(status.upper(), style="bold green" if status == "generating" else "dim")
             table.add_row(
                 f"{prefix}{cid[:8]}",
+                project_name,
                 title,
                 short_model_name(str(c.get("model_name") or "unknown")),
                 fmt_int(c.get("planner_steps_count")),
@@ -188,7 +200,8 @@ def build_kpi_grid(
     selected_model_entry: dict[str, Any] | None,
 ) -> Table:
     """Build the 4-column KPI summary row (Input, Output, Latest Step, Timing)."""
-    is_all_mode = m.get("mode") == "all"
+    mode = m.get("mode")
+    is_all_mode = is_aggregate_mode(mode)
     global_totals = m.get("totals") or {}
     by_model = m.get("by_model") or []
 
@@ -278,13 +291,18 @@ def build_kpi_grid(
     step_lbl = "Total Steps" if is_all_mode else "Planner Steps"
     time_lines.append(f"{step_lbl}: {fmt_int(scoped_steps_count)}", style="dim")
 
+    timing_title_base = (
+        "Model"
+        if selected_model_entry
+        else ("Project" if mode == "project" else ("Total" if is_all_mode else "Session"))
+    )
     grid.add_row(
         Panel(in_lines, title=f"Input Tokens{scope_tag}", box=box.ROUNDED),
         Panel(out_lines, title=f"Output Tokens{scope_tag}", box=box.ROUNDED),
         Panel(last_lines, title=f"Latest Step{step_tag}{scope_tag}", box=box.ROUNDED),
         Panel(
             time_lines,
-            title=f"{'Model' if selected_model_entry else ('Total' if is_all_mode else 'Session')} Timing{scope_tag}",
+            title=f"{timing_title_base} Timing{scope_tag}",
             box=box.ROUNDED,
         ),
     )
@@ -561,10 +579,15 @@ def build_subagents_table(m: dict[str, Any]) -> Panel:
             if it.get("cost_usd") is not None
             else "—"
         )
+        role_txt = str(it.get("role") or "Subagent")
+        agent_name = str(it.get("agent_name") or "").strip()
+        if agent_name and agent_name.lower() not in role_txt.lower():
+            role_txt = f"{role_txt} · {agent_name}"
+        clean_sub_model = strip_subagent_prefix(str(it.get("model_name") or "unknown")) or "unknown"
         table.add_row(
-            str(it.get("role") or "Subagent"),
+            role_txt,
             str(it.get("conversation_id") or "")[:8],
-            short_model_name(str(it.get("model_name") or "unknown")),
+            short_model_name(clean_sub_model),
             fmt_int(it.get("planner_steps_count")),
             fmt_compact(in_tok),
             fmt_compact(it.get("output_tokens")),
@@ -614,13 +637,12 @@ def build_steps_table(
     table.add_column("Model", max_width=20, no_wrap=True, overflow="ellipsis")
     table.add_column("Ctx (Cache%)", justify="right")
     table.add_column("Out (~Thk)", justify="right")
-    table.add_column("Time", justify="right")
-    table.add_column("tok/s", justify="right", no_wrap=True)
+    table.add_column("Time (~Delay)", justify="right")
     table.add_column("Paygo", justify="right", no_wrap=True)
     table.add_column("Tools", overflow="fold")
 
     if not visible:
-        table.add_row("—", "No steps recorded yet", "—", "—", "—", "—", "—", "")
+        table.add_row("—", "No steps recorded yet", "—", "—", "—", "—", "")
         return Panel(table, title=f"Per-Step Telemetry ({scope} · {shown_note})", box=box.ROUNDED)
 
     for s in visible:
@@ -641,16 +663,28 @@ def build_steps_table(
         out_cell = f"{fmt_int(s.get('output_tokens'))} (~{fmt_int(s.get('est_thinking_tokens'))})"
 
         dur_s = s.get("duration_s")
-        if dur_s is not None:
-            src_short = src_label(s.get("duration_source"))
-            dur_cell = f"{dur_s}s ({src_short})"
-        else:
+        retry_s = float(s.get("retry_wait_s") or 0.0)
+        if is_ckpt:
             dur_cell = "—"
-        if float(s.get("retry_wait_s") or 0) > 0:
-            dur_cell += f" (+{fmt_duration(s['retry_wait_s'])})"
+        elif dur_s is None:
+            dur_cell = f"— (+{fmt_duration(retry_s)})" if retry_s > 0 else "—"
+        else:
+            inf_s = float(dur_s)
+            total_wait_s = inf_s + retry_s
+            est_delay = s.get("est_delay_s")
+            if est_delay is not None:
+                dur_cell = f"{fmt_duration(total_wait_s)} ({fmt_approx_duration(float(est_delay) + retry_s)})"
+            elif retry_s > 0:
+                dur_cell = f"{fmt_duration(total_wait_s)} ({fmt_approx_duration(retry_s)}*)"
+            else:
+                dur_cell = fmt_duration(inf_s)
 
-        tps_cell = str(s["effective_tps"]) if s.get("effective_tps") is not None else "—"
-        cost_cell = fmt_usd(s.get("cost_usd")) if s.get("cost_usd") is not None else "—"
+        pricing_status = s.get("pricing_status")
+        cost_usd = s.get("cost_usd")
+        if (pricing_status in (None, "priced")) and cost_usd is not None:
+            cost_cell = fmt_usd(cost_usd)
+        else:
+            cost_cell = "—"
 
         tools = s.get("tool_names") or []
         if is_ckpt:
@@ -666,7 +700,6 @@ def build_steps_table(
             ctx_cell,
             out_cell,
             dur_cell,
-            tps_cell,
             cost_cell,
             tools_cell,
         )
@@ -676,7 +709,8 @@ def build_steps_table(
 
 def build_header_panel(m: dict[str, Any]) -> Panel:
     """Build the top header summary panel."""
-    is_all = m.get("mode") == "all"
+    mode = m.get("mode")
+    is_agg = is_aggregate_mode(mode)
     status = str(m.get("status") or "idle")
     gen_since = m.get("generating_since_ms")
 
@@ -695,11 +729,15 @@ def build_header_panel(m: dict[str, Any]) -> Panel:
         head.append("○ IDLE", style="dim")
 
     sub = Text()
-    if is_all:
+    if is_agg:
         win = str(m.get("window") or "all")
         n_conv = int(m.get("conversations_count") or 0)
         n_sub = int(m.get("subagents_count") or 0)
-        sub.append(f"Scope: All Conversations ({win})  ·  ", style="bold")
+        if mode == "project":
+            proj_title = str(m.get("title") or m.get("project_name") or "Project")
+            sub.append(f"Scope: Project · {proj_title} ({win})  ·  ", style="bold")
+        else:
+            sub.append(f"Scope: All Conversations ({win})  ·  ", style="bold")
         sub.append(
             f"{n_conv} conv{'s' if n_conv != 1 else ''}"
             + (f" · {n_sub} subagent{'s' if n_sub != 1 else ''}" if n_sub else ""),
@@ -711,6 +749,11 @@ def build_header_panel(m: dict[str, Any]) -> Panel:
         sub.append(f"Conversation: {title}", style="bold")
         if cid:
             sub.append(f" ({cid[:8]})", style="dim")
+        if m.get("project_name"):
+            sub.append(f"   Project: {m['project_name']}", style="dim")
+        if m.get("is_subagent") and m.get("parent_id"):
+            p_title = str(m.get("parent_title") or str(m["parent_id"])[:8])
+            sub.append(f"   ↑ Parent: {p_title}", style="cyan")
 
     if m.get("model_name"):
         sub.append("   Model: ", style="dim")
@@ -743,7 +786,7 @@ def render_report(
         return json.dumps(snap, indent=2)
 
     m = snap.get("metrics") or {}
-    is_all = m.get("mode") == "all"
+    is_all = is_aggregate_mode(m.get("mode"))
     by_model = m.get("by_model") or []
     selected_model_entry = resolve_model_entry(by_model, model_filter)
     active_model_filter = (

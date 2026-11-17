@@ -7,9 +7,8 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-from .engine import ALL_CONVERSATIONS_ID, MetricsEngine, VALID_WINDOWS
-from .formatters import resolve_conversation_id, resolve_model_entry
-from .paths import get_brain_dir, get_state_dir
+from .engine import ALL_CONVERSATIONS_ID, MetricsEngine, PROJECT_SCOPE_PREFIX, VALID_WINDOWS
+from .formatters import resolve_conversation_id, resolve_model_entry, resolve_project_scope_id
 from .report import render_conversation_list, render_report
 from .tui import TUIState, run_tui
 
@@ -57,6 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Aggregate across all conversations instead of a single session.",
     )
     scope_flags.add_argument(
+        "-P",
+        "--project",
+        default=None,
+        help="Aggregate across a project by exact ID/name, prefix, or substring.",
+    )
+    scope_flags.add_argument(
         "-c",
         "--conversation",
         default=None,
@@ -68,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--window",
         choices=list(VALID_WINDOWS),
         default="all",
-        help="Time window when using --all mode (default: all).",
+        help="Time window when using --all or --project mode (default: all).",
     )
     parser.add_argument(
         "-m",
@@ -125,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override persistent cache & pricing override state directory.",
     )
+    parser.add_argument(
+        "--projects-dir",
+        type=Path,
+        default=None,
+        help="Override Antigravity projects metadata directory (default: ~/.gemini/config/projects).",
+    )
     return parser
 
 
@@ -159,19 +170,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.interval <= 0:
         parser.error("--interval must be greater than 0")
 
-    app_data_dir = args.app_data_dir.expanduser() if args.app_data_dir else None
-    brain_dir = (
-        args.brain_dir.expanduser()
-        if args.brain_dir is not None
-        else get_brain_dir(app_data_dir)
+    app_data_dir = (
+        args.app_data_dir.expanduser() if args.app_data_dir is not None else None
     )
-    state_dir = (
-        args.state_dir.expanduser()
-        if args.state_dir is not None
-        else get_state_dir(app_data_dir)
+    brain_dir = args.brain_dir.expanduser() if args.brain_dir is not None else None
+    state_dir = args.state_dir.expanduser() if args.state_dir is not None else None
+    projects_dir = (
+        args.projects_dir.expanduser() if args.projects_dir is not None else None
     )
 
-    engine = MetricsEngine(brain_dir=brain_dir, state_dir=state_dir)
+    engine = MetricsEngine(
+        brain_dir=brain_dir,
+        state_dir=state_dir,
+        app_data_dir=app_data_dir,
+        projects_dir=projects_dir,
+    )
     try:
         convs_payload = engine.list_conversations()
 
@@ -189,6 +202,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         target_conv_id: str | None = None
         if args.all:
             target_conv_id = ALL_CONVERSATIONS_ID
+        elif args.project:
+            resolved_proj = resolve_project_scope_id(
+                convs_payload.get("projects") or [], args.project
+            )
+            if resolved_proj is None:
+                print(
+                    f"[agystats] Project not found matching: {args.project!r}",
+                    file=sys.stderr,
+                )
+                return 2
+            target_conv_id = resolved_proj
         elif args.conversation:
             resolved_cid = resolve_conversation_id(
                 convs_payload.get("conversations") or [], args.conversation
@@ -226,16 +250,29 @@ def main(argv: Sequence[str] | None = None) -> int:
                 str(matched["model_name"]) if matched else args.model
             )
 
+        is_project_scope = bool(
+            target_conv_id and target_conv_id.startswith(PROJECT_SCOPE_PREFIX)
+        )
+        view_mode = (
+            "all"
+            if args.all
+            else ("project" if is_project_scope else "conversation")
+        )
         tui_state = TUIState(
-            view_mode="all" if args.all else "conversation",
+            view_mode=view_mode,
             time_window=args.window,
             val_pool=args.pool,
-            follow_active=not bool(target_conv_id and target_conv_id != ALL_CONVERSATIONS_ID),
+            follow_active=not bool(target_conv_id),
             selected_conv_id=(
                 target_conv_id
-                if (target_conv_id and target_conv_id != ALL_CONVERSATIONS_ID)
+                if (
+                    target_conv_id
+                    and target_conv_id != ALL_CONVERSATIONS_ID
+                    and not is_project_scope
+                )
                 else None
             ),
+            selected_project_scope_id=(target_conv_id if is_project_scope else None),
             model_filter=initial_model_filter,
             show_all_steps=(args.steps < 0),
         )

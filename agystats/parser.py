@@ -10,6 +10,7 @@ import sqlite3
 import time
 from typing import Any
 
+from .metadata import uri_or_path_to_norm_path
 from .models import (
     ConversationState,
     StepMetrics,
@@ -28,10 +29,12 @@ from .models import (
     _extract_base_model_from_orchestrator,
     _extract_user_title_and_text,
     _is_orchestrator_name,
+    _is_unattributed_model,
     _normalize_cli_step_model,
     _parse_iso_epoch,
     _safe_int,
     _unwrap_arg_str,
+    normalize_step_model,
 )
 
 _CHILD_SPAWN_TOOLS = ("invoke_subagent", "swarm", "run_workflow")
@@ -216,8 +219,16 @@ def format_step_model(conv: ConversationState) -> str:
             else "Orchestrator"
         )
         phase = conv.orchestrator_phase or "Planner"
-        return f"{base} · {phase}"
-    return (
+        if not conv.is_subagent:
+            return f"{base} · {phase}"
+        if (
+            conv.hook_reported_model
+            and conv.hook_reported_model != "auto"
+            and not _is_orchestrator_name(conv.hook_reported_model)
+        ):
+            return normalize_step_model(conv.hook_reported_model, is_subagent=True)
+        return normalize_step_model(f"{base} · {phase}", is_subagent=True)
+    candidate = (
         conv.transcript_model
         or (
             conv.hook_reported_model
@@ -228,6 +239,7 @@ def format_step_model(conv: ConversationState) -> str:
         or conv.hook_reported_model
         or "unknown"
     )
+    return normalize_step_model(candidate, is_subagent=conv.is_subagent)
 
 
 def promote_to_orchestrator(conv: ConversationState, phase: str) -> None:
@@ -355,6 +367,13 @@ def ingest_hooks(conv: ConversationState, hook_path: Path | None) -> bool:
                 m_name = ev.get("model_name")
                 if isinstance(m_name, str) and m_name:
                     conv.hook_reported_model = m_name
+                ws_paths = ev.get("workspace_paths")
+                if isinstance(ws_paths, list):
+                    for wp in ws_paths:
+                        if isinstance(wp, str):
+                            norm = uri_or_path_to_norm_path(wp)
+                            if norm and norm not in conv.hook_workspace_paths:
+                                conv.hook_workspace_paths.append(norm)
     except OSError:
         return False
 
@@ -484,6 +503,8 @@ def process_transcript_step(
             if created_at_epoch is not None:
                 conv.last_user_input_epoch = created_at_epoch
             title, clean_text = _extract_user_title_and_text(content)
+            if not conv.prompt_title and title:
+                conv.prompt_title = title
             if not conv.title and title:
                 conv.title = title
             conv.user_chars += len(clean_text)
@@ -839,15 +860,15 @@ def process_transcript_step(
             sub_model = ""
             if t_name in _CHILD_SPAWN_TOOLS:
                 if req_model and req_model.lower() != "inherit":
-                    sub_model = f"Subagent · {req_model}"
+                    sub_model = normalize_step_model(req_model, is_subagent=True)
                 elif conv.orchestrator_active:
                     base_m = _extract_base_model_from_orchestrator(
                         conv.transcript_model,
                         conv.orchestrator_phase or "Planner",
                     )
-                    sub_model = f"Subagent · {base_m}"
-                else:
-                    sub_model = model_label
+                    sub_model = normalize_step_model(base_m, is_subagent=True)
+                elif not _is_unattributed_model(model_label):
+                    sub_model = normalize_step_model(model_label, is_subagent=True)
             conv.pending_tools.append((t_name, role, sub_model))
 
         prev_model = conv.raw_steps[-1].model_name if conv.raw_steps else None
@@ -1577,12 +1598,13 @@ def recompute_conversation(
                 effective_tps = round(raw.output_tokens / duration_s, 1)
 
         step_model = raw.model_name
-        if step_model in ("unknown", "auto"):
+        if _is_unattributed_model(step_model):
             if matched_win is not None and matched_win.model_name not in ("", "auto"):
                 step_model = matched_win.model_name
             elif conv.fallback_model_hint:
                 step_model = conv.fallback_model_hint
 
+        step_model = normalize_step_model(step_model, is_subagent=conv.is_subagent)
         step_switched = bool(steps_out and steps_out[-1].model_name != step_model)
 
         steps_out.append(
@@ -1634,10 +1656,10 @@ def recompute_conversation(
         )
     else:
         conv.current_tokens = last_ctx_step.total_context
-    if conv.orchestrator_active or conv.transcript_model:
+    if (conv.orchestrator_active and not conv.is_subagent) or conv.transcript_model:
         conv.current_model_name = format_step_model(conv)
     else:
-        conv.current_model_name = (
+        raw_current = (
             (
                 conv.hook_reported_model
                 if conv.hook_reported_model and conv.hook_reported_model != "auto"
@@ -1648,8 +1670,16 @@ def recompute_conversation(
             or conv.hook_reported_model
             or "unknown"
         )
+        conv.current_model_name = normalize_step_model(
+            raw_current, is_subagent=conv.is_subagent
+        )
     if not conv.title:
-        conv.title = conv.cli_summary_title or conv.conversation_id[:8]
+        conv.title = (
+            conv.external_title
+            or conv.cli_summary_title
+            or conv.prompt_title
+            or conv.conversation_id[:8]
+        )
 
     # Track bounded unrecovered failed turns (excluding user cancellations & silent aborts)
     matched_spans = [
@@ -1729,6 +1759,7 @@ def recompute_conversation(
             m_attr = w.model_name
         elif conv.current_model_name:
             m_attr = conv.current_model_name
+        m_attr = normalize_step_model(m_attr, is_subagent=conv.is_subagent)
 
         failed_turns.append(
             _RawFailedTurn(
@@ -1987,11 +2018,17 @@ def _would_create_parent_cycle(
 def link_subagents(
     conversations: dict[str, ConversationState],
     on_hint_changed: Callable[[ConversationState], None],
-    cli_parents: dict[str, str] | None = None,
 ) -> None:
     """Link direct child subagents to their parent and propagate fallback model hints."""
+    prev_state = {
+        cid: (c.is_subagent, c.fallback_model_hint)
+        for cid, c in conversations.items()
+    }
     for conv in conversations.values():
         conv.parent_id = None
+        conv.nesting_depth = 0
+
+    pending_hints: dict[str, str] = {}
     for parent in conversations.values():
         for child_id in parent.child_subagents:
             child = conversations.get(child_id)
@@ -2004,23 +2041,57 @@ def link_subagents(
             ):
                 child.parent_id = parent.conversation_id
                 hint = parent.child_subagent_models.get(child_id, "")
-                if hint != child.fallback_model_hint:
-                    child.fallback_model_hint = hint
-                    on_hint_changed(child)
-    if cli_parents:
-        for child_id, parent_id in cli_parents.items():
-            child = conversations.get(child_id)
-            parent = conversations.get(parent_id)
+                pending_hints[child_id] = (
+                    normalize_step_model(hint, is_subagent=True) if hint else ""
+                )
+    for child in conversations.values():
+        if child.parent_id is not None or not child.external_parent_id:
+            continue
+        parent = conversations.get(child.external_parent_id)
+        if (
+            parent is not None
+            and child.external_parent_id != child.conversation_id
+            and not _would_create_parent_cycle(
+                conversations, parent.conversation_id, child.conversation_id
+            )
+        ):
+            child.parent_id = parent.conversation_id
+            fallback_role = (
+                child.external_title
+                or (f"Subagent · {child.agent_name}" if child.agent_name else "Subagent")
+            )
+            parent.child_subagents.setdefault(child.conversation_id, fallback_role)
             if (
-                child is not None
-                and parent is not None
-                and child.parent_id is None
-                and child_id != parent_id
-                and not _would_create_parent_cycle(conversations, parent_id, child_id)
+                not child.fallback_model_hint
+                and not _is_unattributed_model(parent.current_model_name)
             ):
-                child.parent_id = parent_id
-                if child_id not in parent.child_subagents:
-                    parent.child_subagents[child_id] = child.title or "Subagent"
+                derived = normalize_step_model(
+                    parent.current_model_name, is_subagent=True
+                )
+                if not _is_unattributed_model(derived):
+                    pending_hints[child.conversation_id] = derived
+    for conv in conversations.values():
+        depth = 0
+        cur: ConversationState | None = conv
+        visited: set[str] = set()
+        while (
+            cur is not None
+            and cur.parent_id
+            and cur.parent_id in conversations
+            and cur.conversation_id not in visited
+        ):
+            visited.add(cur.conversation_id)
+            depth += 1
+            cur = conversations.get(cur.parent_id)
+        conv.nesting_depth = depth
+
+    for cid, conv in conversations.items():
+        now_sub = conv.parent_id is not None
+        new_hint = pending_hints.get(cid, conv.fallback_model_hint) if now_sub else ""
+        if (now_sub, new_hint) != prev_state[cid]:
+            conv.is_subagent = now_sub
+            conv.fallback_model_hint = new_hint
+            on_hint_changed(conv)
 
 
 def root_ancestor_id(conversations: dict[str, ConversationState], cid: str) -> str:

@@ -6,6 +6,16 @@ import os
 from pathlib import Path
 
 
+def _app_data_from_executable_data_dir(raw_dir: str | None) -> Path | None:
+    if not raw_dir or not raw_dir.strip():
+        return None
+    p = Path(raw_dir.strip()).expanduser()
+    for candidate in (p, *p.parents):
+        if candidate.name == "sidecar_data" and candidate.parent != candidate:
+            return candidate.parent
+    return None
+
+
 def get_app_data_dir() -> Path:
     """Resolve the Antigravity app data directory, preferring Antigravity CLI."""
     for env_key in (
@@ -18,12 +28,29 @@ def get_app_data_dir() -> Path:
         if explicit:
             return Path(explicit).expanduser()
 
+    exec_app_data = _app_data_from_executable_data_dir(
+        os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR")
+    )
+    if exec_app_data is not None:
+        return exec_app_data
+
     gemini_root = Path.home() / ".gemini"
     cli_dir = gemini_root / "antigravity-cli"
     desktop_dir = gemini_root / "antigravity"
-    if cli_dir.is_dir() or not desktop_dir.is_dir():
+    if cli_dir.is_dir():
         return cli_dir
-    return desktop_dir
+    if desktop_dir.is_dir() and (desktop_dir / "brain").is_dir():
+        return desktop_dir
+    if gemini_root.is_dir():
+        try:
+            for cand in sorted(gemini_root.iterdir(), key=lambda c: c.name):
+                if cand.name != "config" and cand.is_dir() and (cand / "brain").is_dir():
+                    return cand
+        except OSError:
+            pass
+    if desktop_dir.is_dir():
+        return desktop_dir
+    return cli_dir
 
 
 def get_brain_dir(app_data_dir: Path | None = None) -> Path:
@@ -35,6 +62,21 @@ def get_brain_dir(app_data_dir: Path | None = None) -> Path:
                 return Path(explicit).expanduser()
     base = Path(app_data_dir).expanduser() if app_data_dir is not None else get_app_data_dir()
     return base / "brain"
+
+
+def get_projects_dir(app_data_dir: Path | None = None) -> Path:
+    """Resolve the Antigravity projects metadata directory."""
+    for env_key in ("AGYSTATS_PROJECTS_DIR", "AGY_METRICS_PROJECTS_DIR"):
+        explicit = os.environ.get(env_key)
+        if explicit:
+            return Path(explicit).expanduser()
+    base = Path(app_data_dir).expanduser() if app_data_dir is not None else get_app_data_dir()
+    cand = base.parent / "config" / "projects"
+    if cand.is_dir():
+        return cand
+    if app_data_dir is None:
+        return Path.home() / ".gemini" / "config" / "projects"
+    return cand
 
 
 def get_state_dir(app_data_dir: Path | None = None) -> Path:

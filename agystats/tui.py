@@ -16,11 +16,12 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
-from .engine import ALL_CONVERSATIONS_ID, MetricsEngine, VALID_WINDOWS
+from .engine import ALL_CONVERSATIONS_ID, MetricsEngine, PROJECT_SCOPE_PREFIX, VALID_WINDOWS
 from .formatters import (
     fmt_compact,
     fmt_credits,
     fmt_usd,
+    is_aggregate_mode,
     resolve_model_entry,
     short_model_name,
 )
@@ -44,11 +45,12 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 
 @dataclass
 class TUIState:
-    view_mode: str = "conversation"  # "conversation" | "all"
+    view_mode: str = "conversation"  # "conversation" | "project" | "all"
     time_window: str = "all"  # "5h" | "24h" | "7d" | "30d" | "all"
     val_pool: str = "all"  # "all" | "gemini" | "partner"
     follow_active: bool = True
     selected_conv_id: str | None = None
+    selected_project_scope_id: str | None = None
     model_filter: str | None = None
     show_all_steps: bool = False
     show_cold_prefills: bool = False
@@ -59,6 +61,8 @@ class TUIState:
 def requested_conv_id(state: TUIState) -> str | None:
     if state.view_mode == "all":
         return ALL_CONVERSATIONS_ID
+    if state.view_mode == "project":
+        return state.selected_project_scope_id
     return None if state.follow_active else state.selected_conv_id
 
 
@@ -84,8 +88,55 @@ def apply_tui_key(key: str, state: TUIState, snapshot: dict[str, Any]) -> bool:
 
     if key in ("\t", "a", "A"):
         state.view_mode = "all" if state.view_mode == "conversation" else "conversation"
+        state.selected_project_scope_id = None
         state.step_scroll = 0
         state.status_message = f"View: {'All Conversations' if state.view_mode == 'all' else 'Conversation'}"
+        return True
+
+    if key in ("p", "P"):
+        proj_list = convs_payload.get("projects") or []
+        proj_ids = [str(p["project_id"]) for p in proj_list if p.get("project_id")]
+        if not proj_ids:
+            state.status_message = "No projects available"
+            return True
+        active_proj_id = convs_payload.get("active_project_id")
+        if state.view_mode != "project" or not state.selected_project_scope_id:
+            target_pid = active_proj_id if active_proj_id in proj_ids else proj_ids[0]
+        else:
+            cur_pid = (
+                state.selected_project_scope_id[len(PROJECT_SCOPE_PREFIX) :]
+                if state.selected_project_scope_id.startswith(PROJECT_SCOPE_PREFIX)
+                else state.selected_project_scope_id
+            )
+            if cur_pid in proj_ids:
+                target_pid = proj_ids[(proj_ids.index(cur_pid) + 1) % len(proj_ids)]
+            else:
+                target_pid = proj_ids[0]
+        state.view_mode = "project"
+        state.follow_active = False
+        state.selected_project_scope_id = f"{PROJECT_SCOPE_PREFIX}{target_pid}"
+        state.step_scroll = 0
+        proj_name = str(
+            next(
+                (p.get("name") for p in proj_list if p.get("project_id") == target_pid),
+                target_pid,
+            )
+        )
+        state.status_message = f"Project: {proj_name}"
+        return True
+
+    if key in ("u", "U", "\x7f"):
+        parent_id = metrics.get("parent_id")
+        if metrics.get("is_subagent") and parent_id:
+            state.view_mode = "conversation"
+            state.follow_active = False
+            state.selected_project_scope_id = None
+            state.selected_conv_id = str(parent_id)
+            state.step_scroll = 0
+            p_title = str(metrics.get("parent_title") or str(parent_id)[:8])
+            state.status_message = f"Parent: {p_title[:36]}"
+        else:
+            state.status_message = "Not viewing a subagent"
         return True
 
     if key in ("[", "]"):
@@ -103,6 +154,7 @@ def apply_tui_key(key: str, state: TUIState, snapshot: dict[str, Any]) -> bool:
         next_id = ids[(cur_idx + step_dir) % len(ids)]
         state.view_mode = "conversation"
         state.follow_active = False
+        state.selected_project_scope_id = None
         state.selected_conv_id = next_id
         state.step_scroll = 0
         next_title = str(
@@ -113,6 +165,7 @@ def apply_tui_key(key: str, state: TUIState, snapshot: dict[str, Any]) -> bool:
 
     if key in ("f", "F"):
         state.follow_active = not state.follow_active
+        state.selected_project_scope_id = None
         if state.follow_active:
             state.selected_conv_id = None
             state.status_message = "Follow active: ON"
@@ -126,8 +179,9 @@ def apply_tui_key(key: str, state: TUIState, snapshot: dict[str, Any]) -> bool:
         return True
 
     if key in ("w", "W"):
-        if state.view_mode != "all":
+        if not is_aggregate_mode(state.view_mode):
             state.view_mode = "all"
+            state.selected_project_scope_id = None
         else:
             state.time_window = _cycle_option(VALID_WINDOWS, state.time_window)
         state.step_scroll = 0
@@ -199,20 +253,24 @@ def _build_top_bar(snapshot: dict[str, Any], state: TUIState) -> Panel:
     m = snapshot.get("metrics") or {}
     convs = (snapshot.get("conversations") or {}).get("conversations") or []
     active_id = (snapshot.get("conversations") or {}).get("active_conversation_id")
-    is_all = m.get("mode") == "all"
+    raw_mode = m.get("mode")
+    eff_mode = raw_mode if raw_mode in ("all", "project") else "conversation"
+    is_all = is_aggregate_mode(eff_mode)
 
     line1 = Text()
     line1.append("AGYSTATS LIVE  ", style="bold bright_cyan")
-    if not is_all:
-        line1.append("[Conversation]", style="bold reverse cyan")
+    for mode_key, label in (
+        ("conversation", "Conversation"),
+        ("project", "Project"),
+        ("all", "All"),
+    ):
+        if eff_mode == mode_key:
+            line1.append(f"[{label}]", style="bold reverse cyan")
+        else:
+            line1.append(f" {label} ", style="dim")
         line1.append(" ")
-        line1.append(" All ", style="dim")
-    else:
-        line1.append(" Conversation ", style="dim")
-        line1.append(" ")
-        line1.append("[All]", style="bold reverse cyan")
 
-    line1.append("   ")
+    line1.append("  ")
     status = str(m.get("status") or "idle")
     gen_since = m.get("generating_since_ms")
     if status == "generating":
@@ -231,6 +289,10 @@ def _build_top_bar(snapshot: dict[str, Any], state: TUIState) -> Panel:
 
     line2 = Text()
     if is_all:
+        if eff_mode == "project":
+            proj_title = str(m.get("title") or m.get("project_name") or "Project")
+            line2.append("Project: ", style="dim")
+            line2.append(f"{proj_title}   ", style="bold")
         line2.append("Window: ", style="dim")
         for w in VALID_WINDOWS:
             if w == state.time_window:
@@ -253,6 +315,11 @@ def _build_top_bar(snapshot: dict[str, Any], state: TUIState) -> Panel:
         line2.append(f"{'★ ' if is_star else ''}{title}", style="bold")
         if cid:
             line2.append(f" ({cid[:8]})", style="dim")
+        if m.get("project_name"):
+            line2.append(f"   Proj: {m['project_name']}", style="dim")
+        if m.get("is_subagent") and m.get("parent_id"):
+            p_title = str(m.get("parent_title") or str(m["parent_id"])[:8])
+            line2.append(f"   ↑ Parent: {p_title[:24]}", style="cyan")
         line2.append(
             f"   Follow: {'ON' if state.follow_active else 'OFF'}",
             style="green" if state.follow_active else "yellow",
@@ -263,20 +330,27 @@ def _build_top_bar(snapshot: dict[str, Any], state: TUIState) -> Panel:
     return Panel(Group(line1, line2), box=box.ROUNDED, border_style="cyan")
 
 
-def _build_footer(state: TUIState) -> Text:
+def _build_footer(state: TUIState, *, is_subagent: bool = False) -> Text:
     foot = Text()
     bindings = [
         ("q", "Quit"),
         ("Tab/a", "Mode"),
+        ("p", "Proj"),
         ("[/]", "Conv"),
-        ("f", "Follow"),
-        ("w", "Window"),
-        ("m", "Model"),
-        ("g", "Pool"),
-        ("s", "Steps"),
-        ("j/k", "Scroll"),
-        ("r", "Refresh"),
     ]
+    if is_subagent:
+        bindings.append(("u", "Parent"))
+    bindings.extend(
+        [
+            ("f", "Follow"),
+            ("w", "Window"),
+            ("m", "Model"),
+            ("g", "Pool"),
+            ("s", "Steps"),
+            ("j/k", "Scroll"),
+            ("r", "Refresh"),
+        ]
+    )
     for idx, (k, desc) in enumerate(bindings):
         if idx > 0:
             foot.append("  ", style="dim")
@@ -297,7 +371,7 @@ def build_tui_renderable(
 ) -> Group:
     """Build one complete Rich renderable frame for the realtime TUI."""
     m = snapshot.get("metrics") or {}
-    is_all = m.get("mode") == "all"
+    is_all = is_aggregate_mode(m.get("mode"))
     by_model = m.get("by_model") or []
     selected_model_entry = resolve_model_entry(by_model, state.model_filter)
     active_model_filter = (
@@ -362,7 +436,7 @@ def build_tui_renderable(
             )
         )
 
-    sections.append(_build_footer(state))
+    sections.append(_build_footer(state, is_subagent=bool(not is_all and m.get("is_subagent") and m.get("parent_id"))))
     return Group(*sections)
 
 

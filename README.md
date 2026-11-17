@@ -16,6 +16,7 @@ uv run agystats tui --all --window 24h
 # Report mode (text summary)
 uv run agystats report
 uv run agystats report --all --window 7d
+uv run agystats report --project agystats --window 24h
 uv run agystats report --conversation <id-or-title> --model argon
 uv run agystats report --json
 uv run agystats report --no-color
@@ -31,7 +32,9 @@ uv run agystats.py report
 
 - `q` / `Ctrl+C` / `Ctrl+D`: Quit
 - `Tab` / `a`: Toggle `Conversation` vs `All` mode
+- `p`: Switch to `Project` mode and cycle projects
 - `[` / `]`: Switch to previous / next conversation
+- `u` / `Backspace`: Jump to parent conversation when inspecting a subagent
 - `f`: Toggle `Follow active`
 - `w`: Cycle time window (`5h`, `24h`, `7d`, `30d`, `all`)
 - `m`: Cycle per-model filter & P95 latency roofline scatterplot

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import unittest
 
-from agystats.models import _normalize_cli_step_model
+from agystats.models import _normalize_cli_step_model, humanize_model_name, normalize_step_model
 from agystats.pricing import PricingCatalog
 from agystats.roofline import compute_roofline_fit
 
@@ -47,6 +47,50 @@ class TestPricingAndRoofline(unittest.TestCase):
         self.assertEqual(res_worker.status, "priced")
         self.assertIsNotNone(res_worker.entry)
         self.assertEqual(res_worker.entry.catalog_id, "gemini-4-hydrogen")
+
+    def test_humanize_normalize_and_subagent_pricing_resolution(self) -> None:
+        cases = [
+            ("gemini-4-hydrogen-tiered-high", "Gemini 4 Hydrogen (High)"),
+            ("gemini-4-carbon-tiered-high", "Gemini 4 Carbon (High)"),
+            ("gemini-3.1-pro-tiered-high", "Gemini 3.1 Pro (High)"),
+            ("gemini-3-flash-tiered-low", "Gemini 3 Flash (Low)"),
+            ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+            ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)"),
+            ("gpt-oss-120b-medium", "GPT-OSS 120B (Medium)"),
+            ("claude-3-5-sonnet-20241022", "Claude 3.5 Sonnet"),
+            ("flash_lite", "Gemini Flash-Lite"),
+            ("pro", "Gemini Pro"),
+            ("gemini-flash-worker-agy", "Gemini 4 Hydrogen"),
+            ("unknown", "unknown"),
+            ("auto", "auto"),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(humanize_model_name(raw), expected, raw)
+
+        self.assertEqual(
+            normalize_step_model("gemini-4-hydrogen-tiered-high", is_subagent=True),
+            "Subagent · Gemini 4 Hydrogen (High)",
+        )
+        self.assertEqual(
+            normalize_step_model("Orchestrator (Carbon) · Executor", is_subagent=True),
+            "Subagent · Gemini 4 Hydrogen",
+        )
+        self.assertEqual(
+            normalize_step_model("Subagent · gemini-4-hydrogen-tiered-high", is_subagent=True),
+            "Subagent · Gemini 4 Hydrogen (High)",
+        )
+
+        cat = PricingCatalog(as_of_date="2026-11-16")
+        for model_name, expected_id in (
+            ("Subagent · Gemini 4 Hydrogen (High)", "gemini-4-hydrogen"),
+            ("Subagent · Gemini Flash-Lite", "gemini-flash-lite"),
+            ("Subagent · Gemini Pro", "gemini-pro"),
+            ("Gemini 4 Pro", "gemini-pro"),
+        ):
+            res = cat.resolve_model(model_name)
+            self.assertEqual(res.status, "priced", model_name)
+            self.assertIsNotNone(res.entry, model_name)
+            self.assertEqual(res.entry.catalog_id, expected_id, model_name)
 
     def test_roofline_fit_recovers_nominal_ceiling_and_guards(self) -> None:
         too_few = compute_roofline_fit(((100, 2.0, "db_ms"), (500, 6.0, "db_ms")))

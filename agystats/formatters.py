@@ -8,7 +8,10 @@ from typing import Any
 
 from rich.text import Text
 
+from .models import PROJECT_SCOPE_PREFIX, UNASSIGNED_PROJECT_ID
+
 _ORCH_SHORT_RE = re.compile(r"^Orchestrator\s*\(([^)]+)\)\s*·\s*", re.IGNORECASE)
+_SUBAGENT_PREFIX_RE = re.compile(r"^Subagent\s*·\s*", re.IGNORECASE)
 
 _BRAILLE_BITS = (
     (0x01, 0x08),
@@ -93,6 +96,16 @@ def fmt_orch_savings_pct(pct: Any) -> str:
     else:
         n_str = f"{abs(n):.1f}"
     return f"-{n_str}%" if n >= 0 else f"+{n_str}%"
+
+
+def is_aggregate_mode(mode: str | None) -> bool:
+    return mode in ("all", "project")
+
+
+def strip_subagent_prefix(name: str | None) -> str:
+    if not name:
+        return ""
+    return _SUBAGENT_PREFIX_RE.sub("", str(name)).strip()
 
 
 def short_model_name(name: str | None) -> str:
@@ -225,7 +238,52 @@ def resolve_conversation_id(
         for c in conversations
         if q in str(c.get("title") or "").lower()
     ]
-    return title_matches[0] if title_matches else None
+    if title_matches:
+        return title_matches[0]
+    preview_matches = [
+        str(c["conversation_id"])
+        for c in conversations
+        if q in str(c.get("prompt_preview") or "").lower()
+    ]
+    return preview_matches[0] if preview_matches else None
+
+
+def resolve_project_scope_id(
+    projects: list[dict[str, Any]], query: str | None
+) -> str | None:
+    """Resolve an exact project ID/name, prefix, or substring to a `project:<id>` scope."""
+    if not query:
+        return None
+    raw = query.strip()
+    if raw.lower().startswith(PROJECT_SCOPE_PREFIX):
+        raw = raw[len(PROJECT_SCOPE_PREFIX) :].strip()
+    q = raw.lower()
+    if not q:
+        return None
+
+    for p in projects:
+        pid = str(p.get("project_id") or "")
+        pname = str(p.get("name") or "")
+        if pid.lower() == q or pname.lower() == q:
+            return f"{PROJECT_SCOPE_PREFIX}{pid}"
+
+    if q in ("no project", "unassigned"):
+        for p in projects:
+            if str(p.get("project_id") or "") == UNASSIGNED_PROJECT_ID:
+                return f"{PROJECT_SCOPE_PREFIX}{UNASSIGNED_PROJECT_ID}"
+
+    for p in projects:
+        pid = str(p.get("project_id") or "")
+        pname = str(p.get("name") or "")
+        if pid.lower().startswith(q) or pname.lower().startswith(q):
+            return f"{PROJECT_SCOPE_PREFIX}{pid}"
+
+    for p in projects:
+        pid = str(p.get("project_id") or "")
+        pname = str(p.get("name") or "")
+        if q in pname.lower() or q in pid.lower():
+            return f"{PROJECT_SCOPE_PREFIX}{pid}"
+    return None
 
 
 def extract_valuation_cards(
@@ -234,7 +292,7 @@ def extract_valuation_cards(
     val_pool: str = "all",
 ) -> tuple[list[dict[str, Any]], list[tuple[str, str, str]], str]:
     """Build valuation window cards and callouts matching dashboard charts.js semantics."""
-    is_all_mode = metrics.get("mode") == "all"
+    is_all_mode = is_aggregate_mode(metrics.get("mode"))
     val = metrics.get("valuation") or {}
     windows = val.get("windows") or {}
     subs = metrics.get("subagents") or {"count": 0, "items": [], "totals": {}}
@@ -299,9 +357,7 @@ def extract_valuation_cards(
                     diff_pct = round(((fut_usd - c_usd) / c_usd) * 100)
                     pct_tag = f" ({'+' if diff_pct >= 0 else ''}{diff_pct}%)"
                 fut_lbl = f"From {mv['future_effective_date']}"
-                fut_text = (
-                    f"{fmt_usd(fut_usd)} · {fmt_credits(mv.get('future_credits'))}{pct_tag}"
-                )
+                fut_text = f"{fmt_usd(fut_usd)}{pct_tag}"
             return {
                 "label": label,
                 "steps_count": steps_count,
@@ -347,9 +403,7 @@ def extract_valuation_cards(
             if cur_usd > 0 and fut_usd != cur_usd:
                 g_diff = round(((fut_usd - cur_usd) / cur_usd) * 100)
                 pct_tag = f" ({'+' if g_diff >= 0 else ''}{g_diff}%)"
-            p_fut_text = (
-                f"{fmt_usd(fut_usd)} · {fmt_credits(pv.get('future_credits'))}{pct_tag}"
-            )
+            p_fut_text = f"{fmt_usd(fut_usd)}{pct_tag}"
 
         star = "*" if has_gaps else ""
         return {

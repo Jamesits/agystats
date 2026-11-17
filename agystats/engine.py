@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sqlite3
 import statistics
@@ -10,10 +11,14 @@ import threading
 import time
 from typing import Any
 
+from .metadata import ConversationExternalMeta, MetadataIndex
 from .models import (
     ALL_CONVERSATIONS_ID,
     ConversationState,
+    PROJECT_SCOPE_PREFIX,
     StepMetrics,
+    UNASSIGNED_PROJECT_ID,
+    UNASSIGNED_PROJECT_NAME,
     VALID_WINDOWS,
     _FIT_MAX_RECENT_STEPS,
     _LIVE_GENERATING_STALE_MS,
@@ -22,12 +27,14 @@ from .models import (
     _WINDOW_SECONDS,
     _is_unattributed_model,
     _safe_int,
+    normalize_step_model,
 )
 from . import parser as _parser
 from .paths import (
+    get_app_data_dir,
     get_brain_dir,
     get_cli_conversations_dir,
-    get_cli_summaries_db_path,
+    get_projects_dir,
     get_state_dir,
 )
 from .pricing import PricingCatalog
@@ -36,6 +43,9 @@ from .storage import MetricsStore
 
 __all__ = [
     "ALL_CONVERSATIONS_ID",
+    "PROJECT_SCOPE_PREFIX",
+    "UNASSIGNED_PROJECT_ID",
+    "UNASSIGNED_PROJECT_NAME",
     "VALID_WINDOWS",
     "_MAX_HYDRATED_CONVS",
     "ConversationState",
@@ -53,19 +63,45 @@ class MetricsEngine:
         state_dir: Path | None = None,
         as_of_date: str | None = None,
         orphan_hook_grace_s: float = 300.0,
+        app_data_dir: Path | None = None,
+        projects_dir: Path | None = None,
     ) -> None:
-        self.brain_dir = Path(brain_dir) if brain_dir is not None else get_brain_dir()
-        self.state_dir = Path(state_dir) if state_dir is not None else get_state_dir()
+        explicit_app_data = (
+            Path(app_data_dir).expanduser() if app_data_dir is not None else None
+        )
+        self.brain_dir = (
+            Path(brain_dir).expanduser()
+            if brain_dir is not None
+            else get_brain_dir(explicit_app_data)
+        )
+        self.state_dir = (
+            Path(state_dir).expanduser()
+            if state_dir is not None
+            else get_state_dir(explicit_app_data)
+        )
+        if explicit_app_data is not None:
+            self.app_data_dir = explicit_app_data
+        elif brain_dir is not None:
+            self.app_data_dir = self.brain_dir.parent
+        else:
+            self.app_data_dir = get_app_data_dir()
+        if projects_dir is not None:
+            self.projects_dir = Path(projects_dir).expanduser()
+        elif (
+            brain_dir is not None
+            and app_data_dir is None
+            and "AGYSTATS_PROJECTS_DIR" not in os.environ
+            and "AGY_METRICS_PROJECTS_DIR" not in os.environ
+        ):
+            self.projects_dir = self.app_data_dir / "config" / "projects"
+        else:
+            self.projects_dir = get_projects_dir(self.app_data_dir)
         self._cli_convs_dir = get_cli_conversations_dir(self.brain_dir)
-        self._cli_summaries_db_path = get_cli_summaries_db_path(self.brain_dir)
         self._orphan_hook_grace_s = max(0.0, float(orphan_hook_grace_s))
         self._lock = threading.RLock()
         self._conversations: dict[str, ConversationState] = {}
         self._latest_json_sig: tuple[int, int] | None = None
         self._latest_record: dict[str, Any] | None = None
-        self._cli_summaries_sig: tuple[int, int, int, int] | None = None
-        self._cli_summaries: dict[str, dict[str, Any]] = {}
-        self._cli_parents: dict[str, str] = {}
         self._initial_scan_done = False
         self._fit_compute_count: int = 0
         self._transcript_open_count: int = 0
@@ -76,6 +112,7 @@ class MetricsEngine:
         self._state_rev: int = 0
         self._convs_cache: tuple[int, dict[str, Any]] | None = None
         self._metrics_cache: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._metadata = MetadataIndex(self.app_data_dir, self.projects_dir)
         self._pricing = PricingCatalog(state_dir=self.state_dir, as_of_date=as_of_date)
         self._store = MetricsStore(self.state_dir)
         try:
@@ -205,23 +242,53 @@ class MetricsEngine:
             _allow_recover=_allow_recover,
         )
 
-    def _apply_cli_summary_to_conv(self, conv: ConversationState) -> None:
-        meta = self._cli_summaries.get(conv.conversation_id)
-        if meta is None:
+    def _lookup_external_meta(
+        self,
+        conv_id: str,
+        ext_by_lower: dict[str, ConversationExternalMeta] | None = None,
+    ) -> ConversationExternalMeta | None:
+        ext_map = self._metadata.conversations
+        ext = ext_map.get(conv_id)
+        if ext is not None:
+            return ext
+        if ext_by_lower is not None:
+            return ext_by_lower.get(conv_id.lower())
+        low = conv_id.lower()
+        for k, v in ext_map.items():
+            if k.lower() == low:
+                return v
+        return None
+
+    def _apply_external_meta_to_conv(
+        self,
+        conv: ConversationState,
+        ext_by_lower: dict[str, ConversationExternalMeta] | None = None,
+    ) -> None:
+        ext = self._lookup_external_meta(conv.conversation_id, ext_by_lower)
+        if ext is not None:
+            conv.external_title = ext.title
+            conv.cli_summary_title = ext.title
+            conv.cli_summary_running = ext.running
+            conv.agent_name = ext.agent_name
+            conv.external_parent_id = ext.parent_id
+            conv.external_project_id = ext.project_id
+            conv.external_workspace_paths = list(ext.workspace_paths)
+            if ext.title and (not conv.title or conv.title == conv.conversation_id[:8]):
+                conv.title = ext.title
+        else:
+            conv.external_title = ""
+            conv.cli_summary_title = ""
             conv.cli_summary_running = False
-            return
-        title = str(meta.get("title") or "")
-        if title:
-            conv.cli_summary_title = title
-            if not conv.title or conv.title == conv.conversation_id[:8]:
-                conv.title = title
-        conv.cli_summary_running = bool(meta.get("running"))
+            conv.agent_name = ""
+            conv.external_parent_id = ""
+            conv.external_project_id = ""
+            conv.external_workspace_paths = []
 
     def _ensure_hydrated(self, conv: ConversationState) -> None:
         if not conv.hydrated:
             had_sig = conv.persisted_sig
             conv.hydrated = True
-            self._apply_cli_summary_to_conv(conv)
+            self._apply_external_meta_to_conv(conv)
             self._ingest_hooks(conv)
             self._ingest_cli_db(conv)
             self._ingest_transcript(conv)
@@ -251,7 +318,7 @@ class MetricsEngine:
         if conv is None:
             conv = ConversationState(conversation_id=conv_id)
             self._conversations[conv_id] = conv
-        self._apply_cli_summary_to_conv(conv)
+        self._apply_external_meta_to_conv(conv)
         return conv
 
     def _resolve_transcript_path(self, conv: ConversationState) -> Path | None:
@@ -302,86 +369,6 @@ class MetricsEngine:
             self._latest_record = data
             return True
         return False
-
-    def _read_cli_summaries_db(self) -> bool:
-        db_path = self._cli_summaries_db_path
-        sig = _parser.cli_db_signature(db_path)
-        if sig == (0, 0, 0, 0):
-            changed = bool(self._cli_summaries or self._cli_parents)
-            self._cli_summaries_sig = None
-            self._cli_summaries.clear()
-            self._cli_parents.clear()
-            return changed
-
-        if sig == self._cli_summaries_sig:
-            return False
-
-        summaries: dict[str, dict[str, Any]] = {}
-        parents: dict[str, str] = {}
-        conn: sqlite3.Connection | None = None
-        try:
-            uri = f"{db_path.resolve().as_uri()}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-            conn.execute("PRAGMA busy_timeout=500")
-            tables = {
-                str(r[0])
-                for r in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()
-            }
-            if "conversation_summaries" in tables:
-                for row in conn.execute(
-                    """
-                    SELECT conversation_id, title, status, parent_conversation_id, not_fully_idle
-                    FROM conversation_summaries
-                    """
-                ).fetchall():
-                    cid = str(row[0] or "").strip()
-                    if not cid or not _SAFE_CONV_RE.fullmatch(cid):
-                        continue
-                    title = str(row[1] or "").strip()
-                    status_str = str(row[2] or "").strip().upper()
-                    parent_cid = str(row[3] or "").strip()
-                    not_idle = bool(row[4])
-                    running = (
-                        status_str == "CASCADE_RUN_STATUS_RUNNING" or not_idle
-                    )
-                    summaries[cid] = {
-                        "title": title,
-                        "status": status_str,
-                        "running": running,
-                    }
-                    if parent_cid and _SAFE_CONV_RE.fullmatch(parent_cid):
-                        parents[cid] = parent_cid
-            if "conversation_parents" in tables:
-                for row in conn.execute(
-                    "SELECT conversation_id, parent_id FROM conversation_parents"
-                ).fetchall():
-                    cid = str(row[0] or "").strip()
-                    pid = str(row[1] or "").strip()
-                    if (
-                        cid
-                        and pid
-                        and _SAFE_CONV_RE.fullmatch(cid)
-                        and _SAFE_CONV_RE.fullmatch(pid)
-                    ):
-                        parents.setdefault(cid, pid)
-        except (OSError, sqlite3.Error):
-            return False
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except sqlite3.Error:
-                    pass
-
-        changed = (
-            summaries != self._cli_summaries or parents != self._cli_parents
-        )
-        self._cli_summaries_sig = sig
-        self._cli_summaries = summaries
-        self._cli_parents = parents
-        return changed
 
     def is_generating(self) -> bool:
         with self._lock:
@@ -513,12 +500,109 @@ class MetricsEngine:
                 self._recompute_conversation(child)
             self._persist_conversation_rollup(child)
 
-        _parser.link_subagents(
-            self._conversations, _on_hint_changed, cli_parents=self._cli_parents
-        )
+        _parser.link_subagents(self._conversations, _on_hint_changed)
 
     def _expand_related_ids(self, seed_id: str | None) -> set[str]:
         return _parser.expand_related_ids(self._conversations, seed_id)
+
+    def _sync_conversations_metadata(self) -> bool:
+        ext_map = self._metadata.conversations
+        ext_by_lower = {k.lower(): v for k, v in ext_map.items()}
+        prev_snap = {
+            cid: (
+                c.title,
+                c.parent_id,
+                c.project_id,
+                c.project_name,
+                c.agent_name,
+                c.nesting_depth,
+            )
+            for cid, c in self._conversations.items()
+        }
+
+        for conv in self._conversations.values():
+            self._apply_external_meta_to_conv(conv, ext_by_lower=ext_by_lower)
+
+        self._link_subagents()
+
+        def _resolve_own_project(c: ConversationState) -> tuple[str, str]:
+            if c.external_project_id:
+                proj = self._metadata.projects.get(c.external_project_id)
+                if proj is not None:
+                    return (proj.project_id, proj.name)
+            all_paths = [*c.external_workspace_paths, *c.hook_workspace_paths]
+            pid, pname = self._metadata.resolve_project_for_paths(all_paths)
+            if pid:
+                return (pid, pname)
+            if c.external_project_id:
+                return (c.external_project_id, c.external_project_id[:8])
+            return ("", "")
+
+        for conv in self._conversations.values():
+            if conv.external_title:
+                conv.title = conv.external_title
+            elif conv.parent_id:
+                parent = self._conversations.get(conv.parent_id)
+                role = ""
+                if parent is not None:
+                    role = parent.child_subagents.get(conv.conversation_id, "")
+                    if not role:
+                        low_cid = conv.conversation_id.lower()
+                        for k, v in parent.child_subagents.items():
+                            if k.lower() == low_cid:
+                                role = v
+                                break
+                if role and role != "Subagent":
+                    conv.title = role
+                elif conv.prompt_title:
+                    conv.title = conv.prompt_title
+                elif conv.agent_name:
+                    conv.title = f"Subagent · {conv.agent_name}"
+                else:
+                    conv.title = conv.conversation_id[:8]
+            else:
+                conv.title = conv.prompt_title or conv.conversation_id[:8]
+
+        for conv in self._conversations.values():
+            if conv.parent_id is None:
+                conv.project_id, conv.project_name = _resolve_own_project(conv)
+
+        for conv in self._conversations.values():
+            if conv.parent_id is not None:
+                root_id = _parser.root_ancestor_id(
+                    self._conversations, conv.conversation_id
+                )
+                root_conv = self._conversations.get(root_id)
+                if root_conv is not None and root_conv.project_id:
+                    conv.project_id = root_conv.project_id
+                    conv.project_name = root_conv.project_name
+                else:
+                    conv.project_id, conv.project_name = _resolve_own_project(conv)
+
+        meta_changed = False
+        title_updates: list[tuple[str, str]] = []
+        for cid, conv in self._conversations.items():
+            cur = (
+                conv.title,
+                conv.parent_id,
+                conv.project_id,
+                conv.project_name,
+                conv.agent_name,
+                conv.nesting_depth,
+            )
+            old = prev_snap.get(cid)
+            if old != cur:
+                meta_changed = True
+                if (
+                    old is not None
+                    and old[0] != conv.title
+                    and conv.persisted_sig is not None
+                ):
+                    title_updates.append((conv.title, cid))
+
+        if title_updates:
+            self._store.update_persisted_titles(title_updates)
+        return meta_changed
 
     def refresh_if_changed(
         self,
@@ -527,20 +611,23 @@ class MetricsEngine:
     ) -> bool:
         with self._lock:
             latest_changed = self._read_latest_json()
-            cli_summaries_changed = self._read_cli_summaries_db()
+            metadata_changed = self._metadata.refresh_if_changed()
             changed = latest_changed
             if self._pricing.refresh_if_changed():
+                changed = True
+            if metadata_changed:
                 changed = True
             latest_cid = (
                 str(self._latest_record.get("conversation_id") or "")
                 if self._latest_record
                 else ""
             )
-            real_target_id = (
-                None
-                if (not target_id or target_id == ALL_CONVERSATIONS_ID)
-                else target_id
+            is_aggregate_target = (
+                not target_id
+                or target_id == ALL_CONVERSATIONS_ID
+                or target_id.startswith(PROJECT_SCOPE_PREFIX)
             )
+            real_target_id = None if is_aggregate_target else target_id
             now_mono = time.monotonic()
             now_ms = int(time.time() * 1000)
 
@@ -590,9 +677,15 @@ class MetricsEngine:
                 candidate_ids.update(self._expand_related_ids(real_target_id))
                 active_guess = self._select_active_conversation_id()
                 candidate_ids.update(self._expand_related_ids(active_guess))
-                for cid, meta in self._cli_summaries.items():
-                    if meta.get("running") and cid in self._conversations:
+                for cid, ext in self._metadata.conversations.items():
+                    if ext.running and cid in self._conversations:
                         candidate_ids.update(self._expand_related_ids(cid))
+                if metadata_changed:
+                    for c in self._conversations.values():
+                        if c.status == "generating":
+                            candidate_ids.update(
+                                self._expand_related_ids(c.conversation_id)
+                            )
 
             def _cand_sort_key(cid: str) -> tuple[int, int, str]:
                 c_obj = self._conversations.get(cid)
@@ -629,15 +722,20 @@ class MetricsEngine:
                             elif conv.status == "generating":
                                 conv.status = "idle"
                                 conv.generating_since_ms = None
-                        elif cli_summaries_changed or not self._initial_scan_done:
+                        elif metadata_changed or not self._initial_scan_done:
                             if (
                                 conv.cli_summary_running
-                                and 0 <= (now_ms - conv.updated_at_ms) <= _LIVE_GENERATING_STALE_MS
+                                and 0
+                                <= (now_ms - conv.updated_at_ms)
+                                <= _LIVE_GENERATING_STALE_MS
                             ):
                                 conv.status = "generating"
                                 conv.generating_since_ms = conv.updated_at_ms
                                 self._hot_conv_ids[cid] = now_mono
-                            elif conv.status == "generating" and not self._is_live_generating_latest(cid, now_ms):
+                            elif (
+                                conv.status == "generating"
+                                and not self._is_live_generating_latest(cid, now_ms)
+                            ):
                                 conv.status = "idle"
                                 conv.generating_since_ms = None
                         if conv.status != prev_status:
@@ -648,13 +746,15 @@ class MetricsEngine:
                 hook_changed = self._ingest_hooks(conv)
                 cli_db_changed = self._ingest_cli_db(conv)
                 tr_changed = self._ingest_transcript(conv)
-                summary_running_diff = conv.cli_summary_running != (conv.status == "generating")
+                summary_running_diff = conv.cli_summary_running != (
+                    conv.status == "generating"
+                )
                 if (
                     hook_changed
                     or cli_db_changed
                     or tr_changed
                     or (latest_changed and cid == latest_cid)
-                    or (cli_summaries_changed and summary_running_diff)
+                    or (metadata_changed and summary_running_diff)
                     or conv.persisted_sig is None
                 ):
                     self._recompute_conversation(conv)
@@ -663,7 +763,8 @@ class MetricsEngine:
                     changed = True
 
             if changed or not self._initial_scan_done:
-                self._link_subagents()
+                if self._sync_conversations_metadata():
+                    changed = True
                 for conv in self._conversations.values():
                     if conv.parent_id is not None:
                         continue
@@ -731,20 +832,89 @@ class MetricsEngine:
             ):
                 return dict(self._convs_cache[1])
             active_id = self._select_active_conversation_id()
-            items = sorted(
-                self._conversations.values(),
-                key=lambda c: (
-                    0 if c.parent_id is None else 1,
-                    -c.updated_at_ms,
-                    c.conversation_id,
+            active_conv = self._conversations.get(active_id) if active_id else None
+            active_project_id = (
+                (active_conv.project_id or UNASSIGNED_PROJECT_ID)
+                if active_conv is not None
+                else None
+            )
+
+            proj_stats: dict[str, dict[str, Any]] = {}
+            top_by_proj: dict[str, list[ConversationState]] = {}
+            children_by_parent: dict[str, list[ConversationState]] = {}
+
+            for c in self._conversations.values():
+                eff_pid = c.project_id or UNASSIGNED_PROJECT_ID
+                eff_pname = c.project_name or UNASSIGNED_PROJECT_NAME
+                bucket = proj_stats.get(eff_pid)
+                if bucket is None:
+                    bucket = {
+                        "project_id": eff_pid,
+                        "name": eff_pname,
+                        "conversations_count": 0,
+                        "subagents_count": 0,
+                        "updated_at_ms": c.updated_at_ms,
+                        "is_unassigned": eff_pid == UNASSIGNED_PROJECT_ID,
+                    }
+                    proj_stats[eff_pid] = bucket
+                else:
+                    bucket["updated_at_ms"] = max(
+                        int(bucket["updated_at_ms"]), c.updated_at_ms
+                    )
+                if c.parent_id is None or c.parent_id not in self._conversations:
+                    bucket["conversations_count"] += 1
+                    top_by_proj.setdefault(eff_pid, []).append(c)
+                else:
+                    bucket["subagents_count"] += 1
+                    children_by_parent.setdefault(c.parent_id, []).append(c)
+
+            projects_list = sorted(
+                proj_stats.values(),
+                key=lambda p: (
+                    1 if p["is_unassigned"] else 0,
+                    -int(p["updated_at_ms"]),
+                    str(p["name"]).lower(),
+                    str(p["project_id"]),
                 ),
             )
+            for child_list in children_by_parent.values():
+                child_list.sort(key=lambda c: (-c.updated_at_ms, c.conversation_id))
+
+            ordered_items: list[ConversationState] = []
+            visited_cids: set[str] = set()
+
+            def _emit_subtree(node: ConversationState) -> None:
+                if node.conversation_id in visited_cids:
+                    return
+                visited_cids.add(node.conversation_id)
+                ordered_items.append(node)
+                for child in children_by_parent.get(node.conversation_id, ()):
+                    _emit_subtree(child)
+
+            for proj in projects_list:
+                tops = top_by_proj.get(str(proj["project_id"]), [])
+                tops.sort(key=lambda c: (-c.updated_at_ms, c.conversation_id))
+                for root_conv in tops:
+                    _emit_subtree(root_conv)
+
+            for c in sorted(
+                self._conversations.values(),
+                key=lambda x: (-x.updated_at_ms, x.conversation_id),
+            ):
+                _emit_subtree(c)
+
             payload = {
                 "active_conversation_id": active_id,
+                "active_project_id": active_project_id,
+                "projects": projects_list,
                 "conversations": [
                     {
                         "conversation_id": c.conversation_id,
                         "title": c.title,
+                        "prompt_preview": c.prompt_title,
+                        "agent_name": c.agent_name,
+                        "project_id": c.project_id or UNASSIGNED_PROJECT_ID,
+                        "project_name": c.project_name or UNASSIGNED_PROJECT_NAME,
                         "model_name": c.current_model_name,
                         "status": c.status,
                         "planner_steps_count": (
@@ -754,8 +924,12 @@ class MetricsEngine:
                         "updated_at_ms": c.updated_at_ms,
                         "is_subagent": c.parent_id is not None,
                         "parent_id": c.parent_id,
+                        "root_id": _parser.root_ancestor_id(
+                            self._conversations, c.conversation_id
+                        ),
+                        "nesting_depth": c.nesting_depth,
                     }
-                    for c in items
+                    for c in ordered_items
                 ],
             }
             self._convs_cache = (self._state_rev, payload)
@@ -841,13 +1015,45 @@ class MetricsEngine:
         }
 
     def _get_all_conversations_metrics(
-        self, window: str = "all"
+        self, window: str = "all", project_id: str | None = None
     ) -> dict[str, Any]:
         norm_win = window if window in VALID_WINDOWS else "all"
         now_s = time.time()
         cutoff_epoch: float | None = (
             now_s - _WINDOW_SECONDS[norm_win] if norm_win != "all" else None
         )
+
+        if project_id is None:
+            scoped_cids: list[str] | None = None
+            scoped_convs = list(self._conversations.values())
+            mode = "all"
+            resp_conv_id = ALL_CONVERSATIONS_ID
+            resp_title = "All Conversations"
+            project_name = ""
+        else:
+            scoped_convs = [
+                c
+                for c in self._conversations.values()
+                if (c.project_id or UNASSIGNED_PROJECT_ID) == project_id
+            ]
+            scoped_cids = [c.conversation_id for c in scoped_convs]
+            mode = "project"
+            resp_conv_id = f"{PROJECT_SCOPE_PREFIX}{project_id}"
+            proj_meta = self._metadata.projects.get(project_id)
+            if proj_meta is not None:
+                project_name = proj_meta.name
+            elif scoped_convs:
+                project_name = next(
+                    (c.project_name for c in scoped_convs if c.project_name),
+                    UNASSIGNED_PROJECT_NAME
+                    if project_id == UNASSIGNED_PROJECT_ID
+                    else project_id,
+                )
+            elif project_id == UNASSIGNED_PROJECT_ID:
+                project_name = UNASSIGNED_PROJECT_NAME
+            else:
+                project_name = "Unknown Project"
+            resp_title = project_name
 
         def _build_all_valuation(
             selected_val_rows: list[dict[str, Any]],
@@ -858,7 +1064,7 @@ class MetricsEngine:
                 if norm_win == "5h"
                 else self._pricing.build_scoped_valuation(
                     self._store.query_window_val_rows(
-                        now_s - _WINDOW_SECONDS["5h"]
+                        now_s - _WINDOW_SECONDS["5h"], conv_ids=scoped_cids
                     )
                 )
             )
@@ -867,7 +1073,7 @@ class MetricsEngine:
                 if norm_win == "7d"
                 else self._pricing.build_scoped_valuation(
                     self._store.query_window_val_rows(
-                        now_s - _WINDOW_SECONDS["7d"]
+                        now_s - _WINDOW_SECONDS["7d"], conv_ids=scoped_cids
                     )
                 )
             )
@@ -882,7 +1088,7 @@ class MetricsEngine:
         eff_status = "idle"
         eff_gen_since: int | None = None
         max_updated_ms = 0
-        for conv in self._conversations.values():
+        for conv in scoped_convs:
             if conv.updated_at_ms > max_updated_ms:
                 max_updated_ms = conv.updated_at_ms
             if conv.status == "generating":
@@ -899,28 +1105,55 @@ class MetricsEngine:
         active_conv = (
             self._conversations.get(active_conv_id) if active_conv_id else None
         )
-        active_model_name = active_conv.current_model_name if active_conv else ""
+        if project_id is not None and (
+            active_conv is None
+            or (active_conv.project_id or UNASSIGNED_PROJECT_ID) != project_id
+        ):
+            scoped_sorted = sorted(
+                scoped_convs,
+                key=lambda c: (c.updated_at_ms, c.conversation_id),
+                reverse=True,
+            )
+            active_model_name = (
+                scoped_sorted[0].current_model_name if scoped_sorted else ""
+            )
+        else:
+            active_model_name = active_conv.current_model_name if active_conv else ""
 
-        win_models = self._store.query_window_models(cutoff_epoch)
+        win_models = self._store.query_window_models(
+            cutoff_epoch, conv_ids=scoped_cids
+        )
         global_fits: dict[str, dict[str, Any]] = {
             m_name: self._get_global_model_fit_and_sync_delays(m_name)
             for m_name in win_models
         }
-        agg_rows, win_conv_ids = self._store.query_all_model_aggregates(cutoff_epoch)
+        agg_rows, win_conv_ids = self._store.query_all_model_aggregates(
+            cutoff_epoch, conv_ids=scoped_cids
+        )
 
         if cutoff_epoch is None:
-            compacted_count = sum(
-                c.compacted_count for c in self._conversations.values()
-            )
+            compacted_count = sum(c.compacted_count for c in scoped_convs)
             conversations_count = 0
             subagents_count = 0
-            active_cids = {
-                str(r[0])
-                for r in self._db.execute(
-                    "SELECT DISTINCT conv_id FROM conv_model_totals"
-                ).fetchall()
-            }
-            for c in self._conversations.values():
+            if scoped_cids is None:
+                active_cids = {
+                    str(r[0])
+                    for r in self._db.execute(
+                        "SELECT DISTINCT conv_id FROM conv_model_totals"
+                    ).fetchall()
+                }
+            elif scoped_cids:
+                ph = ",".join("?" for _ in scoped_cids)
+                active_cids = {
+                    str(r[0])
+                    for r in self._db.execute(
+                        f"SELECT DISTINCT conv_id FROM conv_model_totals WHERE conv_id IN ({ph})",
+                        tuple(scoped_cids),
+                    ).fetchall()
+                }
+            else:
+                active_cids = set()
+            for c in scoped_convs:
                 step_n = len(c.steps) if c.hydrated else c.summary_steps_count
                 if step_n <= 0 and c.conversation_id not in active_cids:
                     continue
@@ -939,12 +1172,19 @@ class MetricsEngine:
                 else:
                     conversations_count += 1
 
+        extra_project_fields: dict[str, Any] = (
+            {"project_id": project_id, "project_name": project_name}
+            if project_id is not None
+            else {}
+        )
+
         if not agg_rows:
             return {
-                "mode": "all",
+                "mode": mode,
                 "window": norm_win,
-                "conversation_id": ALL_CONVERSATIONS_ID,
-                "title": "All Conversations",
+                "conversation_id": resp_conv_id,
+                "title": resp_title,
+                **extra_project_fields,
                 "model_name": active_model_name,
                 "status": eff_status,
                 "generating_since_ms": eff_gen_since,
@@ -963,6 +1203,16 @@ class MetricsEngine:
         win_args: tuple[Any, ...] = (
             (cutoff_epoch,) if cutoff_epoch is not None else ()
         )
+        if scoped_cids is None:
+            scope_sql = ""
+            scope_args: tuple[Any, ...] = ()
+        elif not scoped_cids:
+            scope_sql = " AND 1 = 0"
+            scope_args = ()
+        else:
+            ph = ",".join("?" for _ in scoped_cids)
+            scope_sql = f" AND conv_id IN ({ph})"
+            scope_args = tuple(scoped_cids)
 
         pooled_sample_delays: list[float] = []
         by_model: list[dict[str, Any]] = []
@@ -1053,10 +1303,11 @@ class MetricsEngine:
                   AND duration_s IS NOT NULL
                   AND duration_s > 0
                   {win_sql}
+                  {scope_sql}
                 ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
                 LIMIT ?
                 """,
-                (m_name, *win_args, _FIT_MAX_RECENT_STEPS),
+                (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
             ).fetchall()
             scatter_steps = []
             win_warm_delays: list[float] = []
@@ -1098,10 +1349,11 @@ class MetricsEngine:
                       AND cold_cache_spike = 0
                       AND est_delay_s IS NOT NULL
                       {win_sql}
+                      {scope_sql}
                     ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
                     LIMIT ?
                     """,
-                    (m_name, *win_args, _FIT_MAX_RECENT_STEPS),
+                    (m_name, *win_args, *scope_args, _FIT_MAX_RECENT_STEPS),
                 ).fetchall()
                 win_warm_delays = [round(float(r[0]), 2) for r in fb_rows]
 
@@ -1145,11 +1397,11 @@ class MetricsEngine:
                        duration_source, tool_exec_s, cold_cache_spike, compacted,
                        est_delay_s, retry_wait_s, retry_count
                 FROM step_lite
-                WHERE model_name = ? {win_sql}
+                WHERE model_name = ? {win_sql} {scope_sql}
                 ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
                 LIMIT 1
                 """,
-                (m_name, *win_args),
+                (m_name, *win_args, *scope_args),
             ).fetchone()
             m_latest = (
                 self._step_lite_row_to_dict(latest_m_row) if latest_m_row else None
@@ -1269,7 +1521,19 @@ class MetricsEngine:
             }
         )
 
-        where_win = "WHERE epoch_s >= ?" if cutoff_epoch is not None else ""
+        where_parts: list[str] = []
+        where_args_list: list[Any] = []
+        if cutoff_epoch is not None:
+            where_parts.append("epoch_s >= ?")
+            where_args_list.append(cutoff_epoch)
+        if scoped_cids is not None:
+            if not scoped_cids:
+                where_parts.append("1 = 0")
+            else:
+                ph = ",".join("?" for _ in scoped_cids)
+                where_parts.append(f"conv_id IN ({ph})")
+                where_args_list.extend(scoped_cids)
+        where_win = ("WHERE " + " AND ".join(where_parts)) if where_parts else ""
         global_last_row = self._db.execute(
             f"""
             SELECT conv_id, ordinal, step_index, created_at, epoch_s, model_name,
@@ -1282,7 +1546,7 @@ class MetricsEngine:
             ORDER BY epoch_s DESC, conv_id DESC, ordinal DESC
             LIMIT 1
             """,
-            win_args,
+            tuple(where_args_list),
         ).fetchone()
         latest_step_dict = (
             self._step_lite_row_to_dict(global_last_row) if global_last_row else None
@@ -1299,10 +1563,11 @@ class MetricsEngine:
         ]
 
         return {
-            "mode": "all",
+            "mode": mode,
             "window": norm_win,
-            "conversation_id": ALL_CONVERSATIONS_ID,
-            "title": "All Conversations",
+            "conversation_id": resp_conv_id,
+            "title": resp_title,
+            **extra_project_fields,
             "model_name": active_model_name,
             "status": eff_status,
             "generating_since_ms": eff_gen_since,
@@ -1381,6 +1646,33 @@ class MetricsEngine:
                 res = self._get_metrics_unlocked(conversation_id, window=window)
                 return dict(res)
 
+    def get_state_etag(
+        self,
+        conversation_id: str | None = None,
+        window: str = "all",
+        refresh: bool = True,
+    ) -> str:
+        with self._lock:
+            if refresh:
+                self.refresh_if_changed(target_id=conversation_id)
+            norm_win = window if window in VALID_WINDOWS else "all"
+            is_agg = conversation_id == ALL_CONVERSATIONS_ID or (
+                isinstance(conversation_id, str)
+                and conversation_id.startswith(PROJECT_SCOPE_PREFIX)
+            )
+            eff_target = (
+                conversation_id
+                if is_agg
+                else (conversation_id or self._select_active_conversation_id() or "")
+            )
+            gen_flag = 1 if self.is_generating() else 0
+            win_bucket = (
+                int(time.time() // 60)
+                if (is_agg and norm_win != "all")
+                else 0
+            )
+            return f"{self._state_rev}:{eff_target}:{norm_win}:{gen_flag}:{win_bucket}"
+
     def get_snapshot(
         self,
         conversation_id: str | None = None,
@@ -1395,6 +1687,9 @@ class MetricsEngine:
             )
             conversations = self.list_conversations(refresh=False)
             return {
+                "etag": self.get_state_etag(
+                    conversation_id, window=window, refresh=False
+                ),
                 "conversations": conversations,
                 "metrics": metrics,
             }
@@ -1406,6 +1701,11 @@ class MetricsEngine:
     ) -> dict[str, Any]:
         if conversation_id == ALL_CONVERSATIONS_ID:
             return self._get_all_conversations_metrics(window=window)
+        if isinstance(conversation_id, str) and conversation_id.startswith(
+            PROJECT_SCOPE_PREFIX
+        ):
+            pid = conversation_id[len(PROJECT_SCOPE_PREFIX) :]
+            return self._get_all_conversations_metrics(window=window, project_id=pid)
 
         latest_cid = (
             str(self._latest_record.get("conversation_id") or "")
@@ -1432,6 +1732,13 @@ class MetricsEngine:
                 "mode": "conversation",
                 "conversation_id": target_id,
                 "title": "No active conversation",
+                "project_id": "",
+                "project_name": "",
+                "agent_name": "",
+                "is_subagent": False,
+                "parent_id": None,
+                "parent_title": "",
+                "root_id": target_id,
                 "model_name": "",
                 "status": "idle",
                 "generating_since_ms": None,
@@ -1679,13 +1986,16 @@ class MetricsEngine:
         for sub_id, sub_role, model_hint in descendants:
             sub_conv = self._conversations.get(sub_id)
             if sub_conv is None:
-                missing_model = model_hint or "unknown"
+                missing_model = normalize_step_model(
+                    model_hint or "unknown", is_subagent=True
+                )
                 res_missing = self._pricing.resolve_model(missing_model)
                 is_priced_empty = res_missing.status == "priced"
                 sub_items.append(
                     {
                         "conversation_id": sub_id,
                         "role": sub_role or "Subagent",
+                        "agent_name": "",
                         "model_name": missing_model,
                         "status": "idle",
                         "planner_steps_count": 0,
@@ -1798,10 +2108,14 @@ class MetricsEngine:
                 item_credits = 0.0 if is_priced_empty else None
                 item_fut = 0.0 if is_priced_empty else None
 
+            sub_role_label = (
+                sub_role if (sub_role and sub_role != "Subagent") else sub_conv.title
+            ) or "Subagent"
             sub_items.append(
                 {
                     "conversation_id": sub_id,
-                    "role": sub_role or sub_conv.title or "Subagent",
+                    "role": sub_role_label,
+                    "agent_name": sub_conv.agent_name,
                     "model_name": sub_conv.current_model_name,
                     "status": sub_conv.status,
                     "planner_steps_count": (
@@ -1899,10 +2213,23 @@ class MetricsEngine:
             "total": dict(total_val),
         }
 
+        parent_conv = (
+            self._conversations.get(conv.parent_id) if conv.parent_id else None
+        )
+        root_id = _parser.root_ancestor_id(
+            self._conversations, conv.conversation_id
+        )
         return {
             "mode": "conversation",
             "conversation_id": conv.conversation_id,
             "title": conv.title,
+            "project_id": conv.project_id or UNASSIGNED_PROJECT_ID,
+            "project_name": conv.project_name or UNASSIGNED_PROJECT_NAME,
+            "agent_name": conv.agent_name,
+            "is_subagent": conv.parent_id is not None,
+            "parent_id": conv.parent_id,
+            "parent_title": parent_conv.title if parent_conv is not None else "",
+            "root_id": root_id,
             "model_name": conv.current_model_name,
             "status": eff_status,
             "generating_since_ms": eff_gen_since,
